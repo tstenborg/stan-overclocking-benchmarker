@@ -1,0 +1,1268 @@
+
+### Instructions
+
+- Windows 11
+    This code is designed for RStudio on Windows 11. It *may* run on Windows 10.
+
+- Admin Execution
+    The code is designed for execution with administrator privileges, i.e.
+    RStudio was invoked via the Windows "Run as administrator" option.
+
+- Ghostscript
+    It's assumed Ghostscript is available on the system, and an invocation path
+    has been set in the RStudio environment variables "GS_CMD" and "R_GSCMD",
+    i.e., the path to a relevant executable such as "gswin64c.exe".
+    The code was not designed for use with Ghostscript more recent than version
+    10.00.0.
+
+- PowerShell
+    It's assumed PowerShell is available on the system. It's typically installed
+    by default in Windows 10 and 11.
+
+- Stan
+     It's assumed R and RStudio have been configured to enable execution of
+     RStan code (Stan's R interface). For more information, see:
+     https://mc-stan.org/rstan/
+
+- ThrottleStop
+    The code is designed for use with ThrottleStop. The code will however run
+    without it.
+
+- Task Scheduler
+    The code toggles activation of the Windows Task Scheduler via dynamic
+    registry manipulation. Full implementation (either full shutdown or full
+    startup) requires also restarting Windows.
+
+- Run Sequence
+    The intended sequence of execution is as follows:
+     1. Run chunk "setup".
+     2. Run chunk "mcmc_sampling".
+     3. Run chunk "test_convergence". It may be necessary to modify the number
+          of warmup and non-warmup iterations of the Stan sampler, to achieve
+          convergence on your system.
+     4. Run chunk "dampen_os_noise".
+     5. Save the RStudio workspace; from the RStudio main menu, select:
+          "Session" --> "Save Workspace As ...".
+     6. Restart Windows.
+     7. Restart RStudio and load the session saved at step 5, i.e., from the
+          RStudio main menu, select:
+            "Session" --> "Load Workspace".
+     8. Start ThrottleStop, and check its "Disable Turbo" checkbox.
+     9. Run the chunk "test_mcmc_throttled".
+    10. Close ThrottleStop.
+    11. Run the chunk "test_mcmc_unthrottled".
+    12. Save final results via "Session" --> "Save Workspace As ..." from the
+          RStudio main menu.
+    13. Restart Windows.
+
+
+```{r setup, include=FALSE}
+
+library(extrafont)      # To change font styles in ggplot2.
+library(grDevices)      # To produce advanced plots.
+library(grid)           # To produce advanced plots.
+library(knitr)          # To set chunk options.
+library(latex2exp)      # To add LaTeX to plots.
+library(parallel)       # To detect available processing cores.
+library(posterior)      # For advanced MCMC diagnostics.
+
+library(ggplot2)        # An egg dependency.
+library(gridExtra)      # An egg dependency.
+library(egg)            # To produce advanced plots.
+
+library(StanHeaders)    # An rstan dependency.
+library(rstan)
+
+# Global knitr options.
+opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+# Avoid recompilation of unchanged Stan programs.
+rstan_options(auto_write = TRUE)
+
+# Notionally global "constant".
+shape_round <- 16
+
+# Configure number of cores and chains to use.
+# N.B. Using 'logical = FALSE' detects physical cores.
+#      Using 'logical = TRUE' (the default) detects logical cores.
+hyperthreading_status <- TRUE
+active_cores <- detectCores(logical = hyperthreading_status)
+options(mc.cores = active_cores)
+
+
+# Utility functions.
+
+background_services_disable <- function() {
+
+  # Dynamically disable superfluous system services and processes.
+  #
+  # Returns,
+  #   a list of lists: list(services = list_service, processes = list_process),
+  #
+  #   where,
+  #   list_service    a list describing services that were shut down.
+  #   list_process    a list describing processes that were shut down.
+  #
+  #   It's intended this list of lists be used to restart the services and
+  #   processes shut down here.
+  #
+  #   N.B. If the function doesn't complete, NULL is returned.
+
+
+  # Some services and processes take a few minute to complete startup.
+  # Ensure the OS session has been running for at least five minutes.
+  last_logon <- sys::as_text(
+    sys::exec_internal(
+      "powershell",
+      args = paste0("net user ", Sys.info()[6],
+                    " | findstr /B /C:'Last logon'")
+    )$stdout
+  )
+  last_logon <- strptime(
+    stringr::str_trim(stringr::str_remove(last_logon, "Last logon")),
+    "%d/%m/%Y %I:%M:%S %p"
+  )
+  time_diff <- as.integer(difftime(Sys.time(), last_logon, units = "mins"))
+  if (time_diff < 5) {
+    cat("Function cancelled. Cannot begin < five minutes after system logon.")
+    mins_left <- 5 - floor(time_diff)
+    if (mins_left == 1) {
+      str_suffix <- " minute."
+    } else {
+      str_suffix <- " minutes."
+    }
+    cat("\nTry again in ", as.character(english::as.english(mins_left)),
+        str_suffix, sep = "")
+    return(NULL)
+  }
+  rm(last_logon)
+  rm(time_diff)
+
+
+  # Ensure the session is being run with administrator privileges.
+  # N.B. Test for text "True" / "False" here, not Boolean TRUE / FALSE.
+  if (
+    sys::as_text(
+      sys::exec_internal(
+        "powershell",
+        args = "[Security.Principal.WindowsIdentity]::GetCurrent().Groups -contains 'S-1-5-32-544'"
+      )$stdout
+    ) != "True"
+  ) {
+    cat("Function cancelled. Should not be executed without elevated rights.")
+    return(NULL)
+  }
+
+
+  # Shut down the Task Scheduler.
+  # Modify the registry key:
+  #   HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Schedule.
+  #
+  # N.B. Change the key's Start value. Assume its original value is 2.
+  #        (Here 2 is an alias for "Automatic (Delayed Start)")
+  #        (Here 4 is an alias for "Disabled)
+  #
+  # Once complete, the Schedule service should appear as Stopped.
+  #
+  print("Disabling Task Scheduler...")
+
+  # Does the registry key need updating?
+  key_value <- sys::as_text(
+    sys::exec_internal(
+      "powershell",
+      args = "$key_val = Get-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Schedule'; $key_val.Start"
+    )$stdout
+  )
+  if (as.integer(key_value) == 2) {
+    sys::exec_wait(
+      "powershell",
+      args = "Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Schedule' -Name 'Start' -Value 4"
+    )
+    cat("Task Scheduler registry details updated. Please restart system.")
+    return(NULL)
+  }
+
+  # Is the service still running?
+  running_test <- tryCatch(
+    expr = {
+      sys::as_text(
+        sys::exec_internal(
+          "powershell",
+          args = c(
+            "Get-Service -Name 'Schedule' | Where-Object {$_.Status -eq 'Running'}"
+          )
+        )$stdout
+      )
+    },
+    error = function(e) {
+      NULL
+    }
+  )
+  if (!is.null(running_test)) {
+    if (length(running_test) > 0) {
+      cat("Task Scheduler set to shut down. Please restart system.")
+      return(NULL)
+    }
+  }
+
+
+  # Processes section ##########################################################
+
+  print("Disabling processes...")
+
+  # Set the processes to be stopped.
+  # Successfully disabling Adobe processes is, prima facie, sensitive to shut
+  # down order.
+
+  consolidated_process_names <- NULL
+  target_processes <- c(
+
+    # Creative Cloud.
+    "Adobe` Desktop` Service",
+
+    # Provides dynamic content for Adobe Creative Cloud.
+    "CCXProcess",
+
+    # Syncs data between a computer and Creative Cloud account.
+    "CoreSync",
+
+    # Facilitates sign-in to Adobe Creative Cloud apps.
+    "Creative` Cloud` Helper",
+
+    # Node.js JavaScript Runtime (used by Creative Cloud).
+    "node",
+
+    # Adobe Collaboration Synchroniser.
+    "AdobeCollabSync",
+
+    # Notification manager for Adobe Creative Cloud.
+    "AdobeNotificationClient",
+
+    # Adobe Acrobat Update Service.
+    "armsvc",
+
+    # Adobe AcroTray.
+    "acrotray",
+
+    # Notification manager for Adobe Acrobat.
+    "AcrobatNotificationClient",
+
+    # Facilitates communications between Adobe apps.
+    "AdobeIPCBroker",
+
+    # Changes audio settings and converts audio file formats.
+    "HPAudioSwitch"
+  )
+
+  list_process <- list(
+    names = target_processes,
+    exists = rep(FALSE, times = length(target_processes)),
+    paths = rep(NULL, times = length(target_processes)),
+    was_suspended = rep(FALSE, times = length(target_processes))
+  )
+
+  for (i in seq_along(list_process$names)) {
+
+    # Test if processes exist via PowerShell.
+    exists_test <- tryCatch(
+      expr = {
+        sys::exec_internal(
+          "powershell",
+          args = paste0(
+            "Get-Process '", list_process$names[i],
+            "' -ErrorAction SilentlyContinue"
+          )
+        )
+      },
+      error = function(e) {
+        NULL
+      }
+    )
+
+    if (!is.null(exists_test)) {
+      list_process$exists[i] <- TRUE
+
+      # Test if processes are suspended.
+      suspended_test <- tryCatch(
+        expr = {
+          sys::exec_internal(
+            "powershell",
+            args = paste0(
+              "$process = Get-Process '", list_process$names[i], "'
+              foreach ($thread in $process.Threads) {
+                if ($thread.ThreadState -eq 'Wait') {
+                  if ($thread.WaitReason.ToString() -eq 'Suspended') {
+                    # Deliberately throw an error to signify a process with
+                    # suspended threads.
+                    throw
+                  }
+                }
+              }"
+            )
+          )
+        },
+        error = function(e) {
+          NULL
+        }
+      )
+      if (is.null(suspended_test)) {
+        list_process$was_suspended[i] <- TRUE
+      }
+
+      # Build process names string.
+      if (is.null(consolidated_process_names)) {
+        consolidated_process_names <- paste0(list_process$names[i])
+      } else {
+        consolidated_process_names <- paste0(
+          consolidated_process_names, ", ", list_process$names[i]
+        )
+      }
+      #
+    }
+  }
+
+  if (!is.null(consolidated_process_names)) {
+
+    # Split process names into individual strings.
+    tmp_pcs <- paste0(
+      "'",
+      stringr::str_replace_all(
+        stringr::str_remove_all(consolidated_process_names, "`"),
+        ", ",
+        "', '"
+      ),
+      "'"
+    )
+    tmp_paths <- paste(
+      rep(
+        "''", length(strsplit(consolidated_process_names, split = ", ")[[1]])
+      ),
+      collapse = ", "
+    )
+
+    # Get process paths.
+    list_process$paths <- sys::as_text(
+      sys::exec_internal(
+        "powershell",
+        args = paste0(
+          "$index = 0\n$paths = @(",
+          tmp_paths,
+          ")\n$processes = @(",
+          tmp_pcs,
+          ")\nforeach ($process in $processes) {$tmpvar = Get-Process $process -ErrorAction SilentlyContinue\nif ( $tmpvar -is [array] ) {$tmppath = $tmpvar.Path[1]} else {$tmppath = $tmpvar.Path}\n$paths[$index] = $tmppath\n$index = $index + 1}\n$paths"
+        )
+      )$stdout
+    )
+
+    # Close relevant processes.
+    sys::exec_wait(
+      "powershell",
+      args = paste0(
+        "Stop-Process -Name ", consolidated_process_names, " -Force"
+      )
+    )
+    # Alternative for sessions not being run with elevated rights.
+    # Currently disabled.
+    # sys::exec_wait(
+    #   "powershell",
+    #   args = paste0(
+    #     "Start-Process PowerShell -ArgumentList '-Command & {Stop-Process -Name ",
+    #     consolidated_process_names, " -Force}' -Verb RunAs -WindowStyle hidden"
+    #   )
+    # )
+  }
+
+
+  # Services section ###########################################################
+
+  print("Disabling services....")
+
+  # Set the services to be stopped.
+  consolidated_service_names <- NULL
+  target_services <- c(
+
+    "AdobeARMservice",
+
+    "AdobeUpdateService",
+
+    # Adobe Genuine Software Service.
+    "AGMService",
+
+    # Adobe Genuine Software Integrity Service.
+    "AGSService",
+
+    # Bluetooth audio device / wireless headphones service.
+    "BthAvctpSvc",
+
+    # Automated checking for Office updates.
+    "ClickToRunSvc",
+
+    # Intel Content Protection HECI Service. Plays certain premium video types.
+    "cphs",
+
+    # Prevents audio and video from being copied as it travels over connections.
+    "cplspcon",
+
+    # Microsoft gaming services. Auto-restarts after 1 minute.
+    #"GamingServices",
+
+    # Microsoft gaming services.
+    "GamingServicesNet",
+
+    "HP` Comm` Recover",
+
+    # Auto-restarts after 1 day.
+    "HPAppHelperCap",
+
+    # Auto-restarts after 1 day.
+    "HPDiagsCap",
+
+    # Auto-restarts after 1 day.
+    "HPNetworkCap",
+
+    # Auto-restarts after 1 day.
+    "HPOmenCap",
+
+    # Auto-restarts after 1 day.
+    "HPPrintScanDoctorService",
+
+    # Auto-restarts after 1 day.
+    "HPSysInfoCap",
+
+    # Auto-restarts after 1 day.
+    "HpTouchpointAnalyticsService",
+
+    # Intel Bluetooth service.
+    "ibtsiva",
+
+    # Intel Graphics Command Centre service.
+    "igccservice",
+
+    # Intel HD Graphics Control Panel service.
+    "igfxCUIService2.0.0.0",
+
+    # Runs Java code in a isolated execution environment for security.
+    "jhi_service",
+
+    # Only used if an external device is connected by Thunderbolt cable.
+    "TbtHostControllerService",
+
+    # <As above>.
+    "TbtP2pShortcutService",
+
+    # Windows Search.
+    "WSearch",
+
+    # Windows Update service.
+    "wuauserv"
+  )
+
+  list_service <- list(
+    names = target_services,
+    exists = rep(FALSE, times = length(target_services)),
+    was_running = rep(FALSE, times = length(target_services))
+  )
+
+  for (i in seq_along(list_service$name)) {
+
+    # Test if services exist via PowerShell.
+    exists_test <- tryCatch(
+      expr = {
+        sys::exec_internal(
+          "powershell",
+          args = c("Get-Service -Name", list_service$names[i],
+                   "-ErrorAction SilentlyContinue")
+        )
+      },
+      error = function(e) {
+        NULL
+      }
+    )
+
+    if (!is.null(exists_test)) {
+      list_service$exists[i] <- TRUE
+
+      # Test if services are running.
+      running_test <- tryCatch(
+        expr = {
+          sys::as_text(
+            sys::exec_internal(
+              "powershell",
+              args = c(
+                "Get-Service -Name", list_service$names[i],
+                "| Where-Object {$_.Status -eq 'Running'} -ErrorAction SilentlyContinue"
+              )
+            )$stdout
+          )
+        },
+        error = function(e) {
+          NULL
+        }
+      )
+
+      if (!is.null(running_test)) {
+        if (length(running_test) > 0) {
+          list_service$was_running[i] <- TRUE
+
+          # Build service names string.
+          if (is.null(consolidated_service_names)) {
+            consolidated_service_names <- list_service$names[i]
+          } else {
+            consolidated_service_names <- paste0(
+              consolidated_service_names, ", ", list_service$names[i]
+            )
+          }
+
+        }
+      }
+    }
+  }
+
+  # Close relevant services.
+  if (!is.null(consolidated_service_names)) {
+    tryCatch(
+      expr = {
+        sys::exec_wait(
+          "powershell",
+          args = paste0("Stop-Service -Name ", consolidated_service_names),
+          std_err = FALSE
+        )
+        # Alternative if running without elevated rights. Currently disabled.
+        # sys::exec_wait(
+        #   "powershell",
+        #   args = paste0(
+        #     "Start-Process PowerShell -ArgumentList '-Command & {Stop-Service -Name ",
+        #     consolidated_service_names, "}' -Verb RunAs -WindowStyle hidden"
+        #   ),
+        #   std_err = FALSE
+        # )
+      },
+      error = function(e) {
+        NULL
+      }
+    )
+  }
+
+  # Wait 90 seconds. Stopping "igfxCUIService2.0.0.0" triggers a child process
+  # which runs for about 60-90 seconds.
+  if (list_service$was_running[which(list_service$names == "igfxCUIService2.0.0.0")] == TRUE) {
+    Sys.sleep(90)
+  }
+
+
+  print("Services and processes disabled.")
+
+  # Return value...
+  list(services = list_service, processes = list_process)
+}
+
+
+background_services_enable <- function(list_restart) {
+
+  # Dynamically re-enable system services and processes.
+  #
+  # Input:
+  #   list_restart    list(services = list_service, processes = list_process)
+  #
+  #   where,
+  #   list_service    a list describing services that were shut down.
+  #   list_process    a list describing processes that were shut down.
+  #
+  # It's assumed list_restart was generated by a call to
+  # background_services_disable().
+  #
+  #   N.B. If the function doesn't complete, NULL is returned.
+
+
+  # Start services section #####################################################
+
+
+  print("Re-enabling services...")
+
+  # Ensure the session is being run with administrator privileges.
+  # N.B. Test for text "True" / "False" here, not Boolean TRUE / FALSE.
+  if (sys::as_text(sys::exec_internal("powershell", args = "[Security.Principal.WindowsIdentity]::GetCurrent().Groups -contains 'S-1-5-32-544'")$stdout) != "True") {
+    cat("Function cancelled. Should not be executed without elevated rights.")
+    return(NULL)
+  }
+
+
+  consolidated_service_names <- NULL
+
+  for (i in seq_along(list_restart$services$names)) {
+    if (list_restart$services$was_running[i] == TRUE) {
+
+      # Build service names string.
+      if (is.null(consolidated_service_names)) {
+        consolidated_service_names <- list_restart$services$name[i]
+      } else {
+        consolidated_service_names <- paste0(
+          consolidated_service_names, ", ", list_restart$services$names[i]
+        )
+      }
+    }
+  }
+
+  # Start relevant services.
+  if (!is.null(consolidated_service_names)) {
+    sys::exec_wait("powershell", args = paste0("Start-Service -Name ", consolidated_service_names))
+    # Alternative for sessions not being run with elevated rights. Currently disabled.
+    #sys::exec_wait("powershell", args = paste0("Start-Process PowerShell -ArgumentList '-Command & {Start-Service -Name ", consolidated_service_names, "}' -Verb RunAs -WindowStyle hidden"))
+  }
+
+
+  # Start processes section ####################################################
+
+  print("Re-enabling processes...")
+
+  consolidated_commands <- NULL
+
+  path_index <- 0
+  for (i in seq_along(list_restart$processes$names)) {
+
+    # Don't restart a process that hasn't been confirmed as present.
+    if (list_restart$processes$exists[i] == FALSE) {
+      next
+    }
+
+    # Don't restart a process that was previously suspended.
+    if (list_restart$processes$was_suspended[i] == TRUE) {
+      next
+    }
+
+    # Don't start a second process instance if one is already running.
+    # (Some explicitly started processes may themselves trigger startup
+    #  of other processes in the target list here.)
+    # So, test if processes are running via PowerShell.
+    path_index <- path_index + 1
+    exists_test <- tryCatch(
+      expr = {
+        sys::exec_internal(
+          "powershell",
+          args = paste0(
+            "Get-Process '",
+            list_restart$processes$names[i],
+            "' -ErrorAction SilentlyContinue"
+          )
+        )
+      },
+      error = function(e) {
+        NULL
+      }
+    )
+    if (!is.null(exists_test)) {
+      next
+    }
+
+    # Build process names string.
+    if (is.null(consolidated_commands)) {
+      consolidated_commands <- paste0(
+        "Start-Process -WindowStyle hidden -FilePath \"",
+        gsub(" ", "` ", list_restart$processes$paths[path_index]),
+        "\""
+      )
+    } else {
+      consolidated_commands <- paste0(
+        consolidated_commands,
+        "; Start-Process -WindowStyle hidden -FilePath \"",
+        gsub(" ", "` ", list_restart$processes$paths[path_index]),
+        "\""
+      )
+    }
+
+
+  }
+
+  # Start relevant processes.
+  if (!is.null(consolidated_commands)) {
+    sys::exec_wait("powershell", args = consolidated_commands)
+    # Alternative for sessions not being run with elevated rights. Currently disabled.
+    #sys::exec_wait("powershell", args = paste0("Start-Process PowerShell -ArgumentList '-Command & {", consolidated_commands, "}' -Verb RunAs -WindowStyle hidden"))
+  }
+
+
+  # Restart the Task Scheduler.
+  # Modify the registry key: HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Schedule.
+  # N.B. Change the key's Start value.
+  #         (Here 2 is an alias for "Automatic (Delayed Start)")
+  #         (Here 4 is an alias for "Disabled)
+  print("Re-enabling Task Scheduler...")
+
+  # Does the registry key need updating?
+  key_value <- sys::as_text(sys::exec_internal("powershell",
+    args = "$key_val = Get-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Schedule'; $key_val.Start")$stdout)
+  if (as.integer(key_value) == 4) {
+    sys::exec_wait("powershell", args = "Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Schedule' -Name 'Start' -Value 2")
+    cat("Task Scheduler registry details updated. Please restart system.\n")
+    return(NULL)
+  }
+
+  # Is the service still disabled?
+  running_test <- tryCatch(
+    expr = {
+      sys::as_text(sys::exec_internal("powershell", args = c("Get-Service -Name 'Schedule' | Where-Object {$_.Status -eq 'Running'}"))$stdout)
+    },
+    error = function(e) {NULL}
+  )
+  if (is.null(running_test) | (length(running_test) == 0)) {
+    cat("Task Scheduler set to start. Please restart system.\n")
+    return(NULL)
+  }
+
+
+  # Return value...
+  "Services and processes enabled."
+}
+
+
+calc_mcmc_runtimes <- function(input_model, input_data, active_cores,
+                               input_seq, hyperthread) {
+
+  # Get runtimes for repeated execution of an input Stan model.
+  #
+  # Parameters:
+  #   input_model     A Stan model.
+  #   input_data      Data to pass to the Stan model.
+  #   active_cores    An integer specifying the number of cores to use for Stan.
+  #   input_seq       A sequence of iterations to test, e.g. 1 .. 200.
+  #   hyperthread     A boolean specifying whether to use hyperthreading.
+  #
+  # Output:
+  #   A data frame of runtimes for each iteration.
+
+  # Load legacy results, if no model supplied.
+  if (is.null(input_model)) {
+    load(file = "adass_model.rda")
+  }
+
+  vec_runtimes <- rep(NA, length(input_seq))
+
+  # Here a 'sampling' call is used with a compiled stan model (produced earlier
+  # with 'stan_model') instead of using a 'stan' call. Maintaining an explicit
+  # reference to a compiled stan model stops it getting garbage collected, in
+  # turn preventing "recompiling to avoid crashing R session" operations. If
+  # a single 'stan' call was used here instead, the compiled model would be
+  # eligible for garbage collection after each evaluation of microbenchmark.
+  #
+  # N.B. The 'rstan_options(auto_write = TRUE)' call during setup only prevents
+  # recompilation of unchanged AND un-garbage collected stan models.
+
+  # Set default benchmarking time unit to seconds.
+  # Remember, microbenchmark does (needed) warmup iterations.
+
+
+  # Collect runtimes.
+  iteration <- 0
+  for (i in input_seq) {
+
+    iteration <- iteration + 1
+
+    # Give a progress indication.
+    cat("get_mcmc_median_runtimes progress: evaluating cores = ", active_cores,
+      ", chains = ", active_cores, "...\n", sep = "")
+
+    vec_runtimes[iteration] <- summary(
+      microbenchmark::microbenchmark(
+        sampling(
+          input_model,
+          data = input_data,
+          chains = active_cores,
+          warmup = 340,   # Stan default is iter/2.
+          iter = 680,     # 700 for physical cores, 680 logical.
+          seed = 1
+        ),
+        times = 1,
+        unit = "s"
+      )
+    )$median
+
+    # Print results in units of seconds.
+    cat(
+      "# cores = ", active_cores,
+      ", # chains = ", active_cores,
+      ", median runtime = ", vec_runtimes[iteration], " seconds.",
+      " (iteration = ", iteration, ")\n",
+      sep = ""
+    )
+
+  }
+
+  # Return results, packaged into a data frame...
+  data.frame(
+    iterations = input_seq,
+    runtimes = vec_runtimes,
+    dummy = factor(0)
+  )
+}
+
+
+plot_finalise <- function(target_file) {
+
+  # Close the active plot and embed fonts from the current font map into it.
+  #
+  # Parameters:
+  #   target_file   Character; a target file name.
+  #
+  # Examples usage:
+  #   plot_finalise("test_file.pdf")
+
+  # Only proceed if the specified file exists.
+  if (file.exists(target_file)) {
+
+    # Shut down the graphics device used to render the plot.
+    # Don't try and shut down the null device (device 1), if it's active.
+    while (!is.null(grDevices::dev.list())) {
+      device_num <- as.integer(dev.cur())
+      if (device_num != 1) {
+        dev.off(which = device_num)
+      }
+
+      # Release memory.
+      rm(device_num)
+    }
+
+    embed_fonts(target_file)
+    call(plot_crop(target_file))
+  }
+}
+
+
+plot_fix_panels <- function(input_plots, scale_x = 1, scale_y = 1) {
+
+  # Apply physical dimensions to a plot panel area.
+  #
+  # Parameters:
+  #   input_plots   One or more ggplot2::ggplot plots.
+  #   scale_x       A numeric value: a plot width scaling factor.
+  #   scale_y       A numeric value: a plot height scaling factor.
+  #
+  # Example usage:
+  #    plot_fix_panels(ggplot2::ggplot() + ggplot2::theme_void())
+
+  panel_side_length <- 42   # 20% of A4 width = 0.2 * 210 mm.
+
+  lapply(
+    list(input_plots),
+    set_panel_size,
+    width = unit(panel_side_length * scale_x, "mm"),
+    height = unit(panel_side_length * scale_y, "mm")
+  )
+}
+
+
+plot_mcmc_runtimes <- function(input_dataframe, plot_filename) {
+
+  # Plot runtimes for repeated execution of an input Stan model.
+  #
+  # Parameters:
+  #   input_dataframe   Dataframe holding benchmarking results.
+  #   plot_filename     A file name to save the plot as.
+
+  # Plot runtimes vs iterations.
+  pdf(plot_filename)
+  #
+  xbreaks <- seq(0, nrow(input_dataframe), by = 50)
+  xlimits <- c(0, nrow(input_dataframe))
+  ybreaks <- seq(0, 88, 22)   # Determined empirically.
+  ylabel <- 5.50
+  ylimits <- c(0, 88)
+  #
+  # Generate plot.
+  ggplot_runtimes <- ggplot(
+    input_dataframe, aes(x = iterations, y = runtimes)
+  ) +
+    geom_point(aes(shape = dummy), size = 1) +
+    geom_line(aes(group = dummy), size = 0.25) +
+    labs(x = "Iteration",
+         y = TeX("Runtime $\\,$(sec)")) +
+    scale_shape_manual(values = c(shape_round)) +
+    scale_x_continuous(breaks = xbreaks, limits = xlimits) +
+    scale_y_continuous(breaks = ybreaks, limits = ylimits) +
+    theme_throttlestop() +
+    geom_label(
+      label = TeX(
+        paste0(
+          "variance$ \\approx ",
+          format(round(var(input_dataframe$runtimes), digits = 1), nsmall = 1),
+          "$\\,sec"
+        ),
+        output = "character"
+      ),
+      family = "CM Roman",
+      parse = TRUE,
+      size = 2.8,
+      x = 136,
+      y = ylabel
+    )
+  grid.arrange(grobs = plot_fix_panels(ggplot_runtimes))
+  plot_finalise(plot_filename)
+
+  # Return value...
+  NULL
+}
+
+
+theme_throttlestop <- function() {
+
+  # A custom ggplot theme.
+  # Returns a ggplot2::theme.
+  #
+  # Example usage:
+  #   plot_temp <- ggplot2::ggplot() + theme_throttlestop()
+
+  # Ensure required fonts are available.
+  stopifnot(validate_ghostscript_paths())
+  loadfonts(quiet = TRUE)
+
+  ggplot2::theme(
+    axis.line = element_line(size = 0.4),
+    axis.text = element_text(colour = "black"),
+    axis.ticks = element_line(colour = "black"),
+    legend.position = "none",
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(colour = "black", fill = "transparent"),
+    panel.grid.major = element_line(
+      size = 0.25,
+      linetype = "dashed",
+      colour = "grey"
+    ),
+    panel.grid.minor = element_line(
+      size = 0.25,
+      linetype = "dashed",
+      colour = "grey"
+    ),
+    text = element_text(family = "CM Roman", size = 10)
+  )
+}
+
+
+validate_ghostscript_paths <- function() {
+
+  # Return a logical value (TRUE or FALSE) indicating whether the expected
+  # Ghostscript-related environment variables have been set to valid values.
+
+
+  # Validate single-valued environment variables.
+  ghostscript_env_vars <- c("GS_CMD", "R_GSCMD")
+  for (env_var in ghostscript_env_vars) {
+    path_test <- Sys.getenv(env_var)
+    if (nchar(path_test) == 0) {
+      cat("Environment variable ", env_var, " is missing.\n", sep = "")
+      return(FALSE)
+
+    } else if (!file.exists(path_test)) {
+      cat("Environment variable ", env_var, " holds an invalid path.\n",
+          sep = "")
+      return(FALSE)
+    }
+  }
+
+
+  # Validate multi-valued environment variables.
+  env_var <- "GS_FONTPATH"
+  multi_path_test <- Sys.getenv(env_var)
+  if (nchar(multi_path_test) == 0) {
+    cat("Environment variable ", env_var, " is missing.\n", sep = "")
+    return(FALSE)
+  }
+
+  for (path_test in strsplit(multi_path_test, ";")[[1]]) {
+    if (nchar(path_test) == 0) {
+      cat("Environment variable ", env_var, " is malformed.\n", sep = "")
+      return(FALSE)
+
+    } else if (!file.exists(path_test)) {
+      cat("Environment variable ", env_var, " holds an invalid path.\n",
+          sep = "")
+      return(FALSE)
+    }
+  }
+
+  # Return value...
+  TRUE
+}
+
+
+# Font config.
+stopifnot(validate_ghostscript_paths())
+loadfonts(quiet = TRUE)
+
+```
+
+
+```{r mcmc_sampling}
+
+# From 'Bayesian Models for Astrophysical Data',
+# by Hilbe, de Souza & Ishida, 2016, Cambridge Univ Press.
+#
+# Code 10.26 Bayesian normal model for cosmological parameter
+#            inference from type Ia supernova data in R using Stan.
+#
+# Statistical Model: Gaussian regression in R using Stan.
+#                    Example using ODE.
+#
+# Astronomy case: Cosmological parameters inference from
+#                 type Ia supernovae data.
+#
+# Data: JLA sample, Betoule et al., 2014
+# http://supernovae.in2p3.fr/sdss_snls_jla/ReadMe.html
+#
+# 1 response (obsy - observed magnitude)
+# 5 explanatory variable (redshift - redshift,
+#                         ObsMag   - apparent magnitude,
+#                         x1       - stretch,
+#                         color    - colour,
+#                         hmass    - host mass)
+
+
+# Set initial conditions.
+z0 <- 0                         # Initial redshift.
+E0 <- 0                         # Integral(1/E) at z0.
+
+# Physical constants.
+c <- 3e5                        # Speed of light (km).
+H0 <- 70                        # Hubble constant.
+
+# Import data.
+# Remote source:
+data <- read.table(
+  "https://raw.githubusercontent.com/astrobayes/BMAD/master/data/Section_10p11/jla_lcparams.txt",
+  header = TRUE
+)
+# Local source, if available:
+#data <- read.table("jla_lcparams.txt", header = TRUE)
+
+# Remove repeated redshifts.
+data <- data[!duplicated(data$zcmb), ]
+
+# Prepare data for Stan.
+index    <- order(data$zcmb)                     # Sort according to redshift.
+stan_data <- list(nobs = nrow(data),             # Number of SNe. Expect 732.
+                  E0 = array(E0, dim = 1),
+                  z0 = z0,
+                  c = c,
+                  H0 = H0,
+                  obs_mag = data$mb[index],      # Apparent magnitude.
+                  redshift = data$zcmb[index],   # Redshift.
+                  x1 = data$x1[index],           # Stretch.
+                  color = data$color[index],     # Colour.
+                  hmass = data$m3rdvar[index])   # Host mass.
+
+# Release unneeded memory.
+rm(c)
+rm(data)
+rm(E0)
+rm(H0)
+rm(index)
+rm(z0)
+
+# Fit
+stan_model <- "
+functions {
+    // ODE for the inverse Hubble parameter.
+    // System State E is 1 dimensional.
+    // The system has 2 parameters theta = (om, w)
+    //
+    // where
+    //
+    //   om:   dark matter energy density
+    //   w:    dark energy equation of state parameter
+    //
+    // The system redshift derivative is
+    //
+    // d.E[1] / d.z = 1.0/sqrt(om * pow(1+z,3) + (1-om) * (1+z)^(3 * (1+w)))
+    //
+    // @param z redshift at which derivatives are evaluated.
+    // @param E system state at which derivatives are evaluated.
+    // @param params parameters for system.
+    // @param x_r real constants for system (empty).
+    // @param x_i integer constants for system (empty).
+
+    real[] Ez(real z,
+              real[] H,
+              real[] params,
+              real[] x_r,
+              int[] x_i) {
+       real dEdz[1];
+       dEdz[1] = 1.0 / sqrt(params[1] * (1 + z)^3
+                 + (1 - params[1]) * (1 + z)^(3 * (1 + params[2])));
+       return dEdz;
+    }
+}
+data {
+   int<lower=1> nobs;            // number of data points
+   real E0[1];                   // integral(1/H) at z=0  
+   real z0;                      // initial redshift, 0
+   real c;                       // speed of light
+   real H0;                      // Hubble parameter
+   vector[nobs] obs_mag;         // observed magnitude at B max
+   real x1[nobs];                // stretch
+   real color[nobs];             // colour
+   real redshift[nobs];          // redshift
+   real hmass[nobs];             // host mass
+}
+transformed data {
+   real x_r[0];                  // required by ODE (empty)
+   int x_i[0]; 
+}
+parameters{
+   real<lower=0, upper=1> om;    // dark matter energy density
+   real alpha;                   // stretch coefficient   
+   real beta;                    // color coefficient
+   real Mint;                    // intrinsic magnitude
+   real deltaM;
+   real<lower=0> sigint;         // magnitude dispersion
+   real<lower=-2, upper=0> w;    // dark matter equation of state parameter
+}
+transformed parameters{
+   real DC[nobs,1];              // co-moving distance 
+   real pars[2];                 // ODE input = (om, w)
+   vector[nobs] mag;             // apparent magnitude
+   real dl[nobs];                // luminosity distance
+   real DH;                      // Hubble distance = c/H0
+
+   DH = c / H0;
+   pars[1] = om;
+   pars[2] = w;
+
+   // Integral of 1/E(z)
+   DC = integrate_ode_rk45(Ez, E0, z0, redshift, pars,  x_r, x_i);
+   for (i in 1:nobs) {
+      dl[i] = DH * (1 + redshift[i]) * DC[i, 1];
+      if (hmass[i] < 10) mag[i] = 25 + 5 * log10(dl[i]) + Mint - alpha * x1[i] + beta * color[i];
+      else mag[i] = 25 + 5 * log10(dl[i]) + Mint + deltaM - alpha * x1[i] + beta * color[i];
+   }
+}
+model {
+   // Priors and likelihood.
+   sigint ~ gamma(0.001, 0.001);
+   Mint ~ normal(-20, 5.);
+   beta ~ normal(0, 10);
+   alpha ~ normal(0, 1);
+   deltaM ~ normal(0, 1);
+   obs_mag ~ normal(mag, sigint);
+}
+"
+
+```
+
+
+```{r test_convergence}
+
+# Generate and save the Stan model.
+stan_model_eval <- stan_model(model_code = stan_model, save_dso = FALSE)
+save(stan_model_eval, file = paste0("adass_model.rda"))
+
+# Test MCMC parameters are consistent with convergence.
+fit <- sampling(
+  stan_model_eval,
+  data = stan_data,
+  chains = active_cores,
+  warmup = 340,   # 350 for 6 physical cores, 340 for 12 logical.
+  iter = 680,     # 700 for 6 physical cores, 680 for 12 logical.
+  seed = 1
+)
+
+# Output results.
+print(fit, pars = c("om", "Mint", "w", "alpha", "beta", "deltaM", "sigint"),
+      intervals = c(0.025, 0.975), digits = 3)
+print(summarise_draws(fit))   # Posterior package results.
+#
+# a) Results are normally ok for Rhat <= 1.05 (from the vanilla rstan results).
+#    Ideally however, Rhat < 1.01 is sought (from the posterior package).
+#    - The posterior package uses an improved version of the traditional Rhat.
+#    - To get high precision values, use: summarise_draws(fit_synth)$rhat
+#
+# b) Results are normally ok if n_eff > 100.
+#    Ideally however, a ratio of n_eff / N >= 0.1 is sought.
+#    (where N = total samples.)
+#    Ref: https://mc-stan.org/bayesplot/articles/visual-mcmc-diagnostics.html
+
+# Free memory.
+rm(fit)
+gc()
+```
+
+
+```{r dampen_os_noise}
+
+# Disable selected background processes and services.
+tmp <- background_services_disable()
+stopifnot(!is.null(tmp))
+
+# It's assumed this code will be quit and Windows restarted after toggling the
+# active status of the Task Manager.
+# It's also assumed the RStudio session will be saved (and later reloaded) prior
+# to continuing from this point. See too the header notes in this Rmd file.
+
+```
+
+
+```{r test_mcmc_throttled}
+
+# Evaluate typical performance of parallelised MCMC.
+
+# Ensure ThrottleStop is running.
+stopifnot(
+  grepl(
+    "ThrottleStop.exe",
+    shell(
+      'tasklist /fi "imagename eq ThrottleStop.exe" /nh /fo csv',
+      intern = TRUE
+    )
+  )
+)
+
+# Collect and plot MCMC runtimes, throttled.
+# It's assumed the "Disable Turbo" checkbox in ThrottleStop is checked at this
+# point.
+iterations_lbound <- 1
+iterations_ubound <- 200
+iterations_seq <- seq(iterations_lbound, iterations_ubound, by = 1)
+
+df_bmark_throttled <- calc_mcmc_runtimes(
+  input_model = stan_model_eval,
+  input_data = stan_data,
+  active_cores = active_cores,
+  input_seq = iterations_seq,
+  hyperthread = hyperthreading_status
+)
+plot_mcmc_runtimes(
+  input_dataframe = df_bmark_throttled,
+  plot_filename = "plot_runtimes_vs_iterations_throttled.pdf"
+)
+
+```
+
+
+```{r test_mcmc_unthrottled}
+
+# It's assumed turbo is re-enabled and ThrottleStop is closed at this point.
+# Ensure ThrottleStop is closed.
+stopifnot(
+  !grepl(
+    "ThrottleStop.exe",
+    shell(
+      'tasklist /fi "imagename eq ThrottleStop.exe" /nh /fo csv',
+      intern = TRUE
+    )
+  )
+)
+
+# Collect and plot MCMC runtimes, unthrottled.
+df_bmark_unthrottled <- calc_mcmc_runtimes(
+  input_model = stan_model_eval,
+  input_data = stan_data,
+  active_cores = active_cores,
+  input_seq = iterations_seq,
+  hyperthread = hyperthreading_status
+)
+plot_mcmc_runtimes(
+  input_dataframe = df_bmark_unthrottled,
+  plot_filename = "plot_runtimes_vs_iterations_unthrottled.pdf"
+)
+
+# Re-enable selected background processes and services.
+stopifnot(!is.null(background_services_enable(tmp)))
+rm(tmp)
+```

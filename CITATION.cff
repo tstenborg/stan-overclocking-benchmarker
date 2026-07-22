@@ -1,0 +1,52 @@
+cff-version: 1.2.0
+title: "Benchmarking Stan under Dynamic Overclocking with ThrottleStop"
+message: "If you use this repository, please cite it using these metadata."
+type: software
+authors:
+  - given-names: Travis
+    family-names: Stenborg
+    orcid: "https://orcid.org/0000-0002-2693-9628"
+url: "https://github.com/tstenborg/stan-overclocking-benchmarker"
+abstract: >-
+  "This repository holds digital assets associated with the article \
+  'Benchmarking Stan under Dynamic Overclocking with ThrottleStop'. That \
+  article discusses the impact of dynamic overclocking on benchmarking the \
+  Stan probabilistic programming language. The ThrottleStop CPU throttling \
+  utility was used to moderate overclocking for an example Bayesian inference \
+  task in astronomy."
+keywords:
+  - astronomy
+  - overclocking
+  - stan
+preferred-citation:
+  authors:
+    - given-names: "Travis N."
+      family-names: Stenborg
+  collection-title: "Astronomical Data Analysis Software and Systems XXXII"
+  conference:
+    # "conference, name" appears in BibTeX format only, as "series".
+    name: "Astronomical Society of the Pacific Conference Series, volume 538"
+  doi: "10.26624/GAQB5323"
+  editors:
+    # "editors" appear in BibTeX format only, as "editor".
+    - given-names: Séverin
+      family-names: Gaudet
+    - given-names: David
+      family-names: Bohlender
+    - given-names: Stephen
+      family-names: Gwyn
+    - given-names: Adam
+      family-names: Hincks
+    - given-names: Peter
+      family-names: Teuben
+  end: 268  # Last page number.
+  # "notes" values should be formatted as single lines.
+  notes: "Proceedings of Astronomical Data Analysis Software and Systems (ADASS) XXXII, an online conference hosted from Victoria, British Columbia, 31 Oct to 04 Nov, 2022."
+  publisher:
+    # "publisher, name" appears in BibTeX format only, as "publisher".
+    name: "Astronomical Society of the Pacific"
+  start: 265  # First page number.
+  title: "Benchmarking Stan under Dynamic Overclocking with ThrottleStop"
+  type: conference-paper
+  volume: 538  # Appears in APA format only.
+  year: 2025
